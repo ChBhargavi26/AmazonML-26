@@ -1,10 +1,8 @@
-data/raw/train/*
-!data/raw/train/.gitkeep
-
-data/raw/test/*
-!data/raw/test/.gitkeep
+# Challenge datasets are stored using Git LFS
+# Do not ignore the TSV files because Git LFS tracks them
 
 data/processed/*
+!data/processed/.gitkeep
 
 # Python
 __pycache__/
