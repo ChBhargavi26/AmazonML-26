@@ -1,5 +1,7 @@
 # Challenge datasets
 data/raw/
+# Processed challenge datasets
+data/processed/
 
 # Python
 __pycache__/
