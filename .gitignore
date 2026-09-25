@@ -1,0 +1,20 @@
+# Challenge datasets
+data/raw/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtual environments
+venv/
+.venv/
+
+# Model files
+models/*.pkl
+models/*.joblib
+
+# Output files
+outputs/
