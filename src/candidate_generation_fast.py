@@ -1,35 +1,67 @@
 from pathlib import Path
-import sqlite3
 import pandas as pd
 import re
 import time
-import os
+from difflib import SequenceMatcher
 
+
+# ============================================================
+# PATHS
+# ============================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-TRAIN_DIR = PROJECT_ROOT / "data" / "raw" / "train"
-PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
+TEST_DIR = PROJECT_ROOT / "data" / "raw" / "test"
+OUTPUT_DIR = PROJECT_ROOT / "outputs"
 
-DB_FILE = PROCESSED_DIR / "blocking_index.db"
-OUTPUT_FILE = PROCESSED_DIR / "candidate_pairs.tsv"
+OUTPUT_DIR.mkdir(exist_ok=True)
 
-CHUNK_SIZE = 10_000
+OUTPUT_FILE = OUTPUT_DIR / "submission.csv"
+
+CHUNK_SIZE = 50_000
+
+# Composite address keys with more than this many records
+# are ignored to reduce false positives.
+MAX_COMPOSITE_CANDIDATES = 20
 
 STOPWORDS = {
-    "the", "and", "for", "with", "from", "that",
-    "this", "inc", "llc", "ltd", "co", "company"
+    "the", "and", "for", "with", "from",
+    "that", "this", "inc", "llc", "ltd",
+    "co", "company", "road", "rd",
+    "street", "st", "avenue", "ave",
+    "boulevard", "blvd", "drive", "dr",
+    "lane", "ln", "way", "highway", "hwy",
+    "floor", "unit", "building", "bldg"
 }
 
+
+# ============================================================
+# NORMALIZATION
+# ============================================================
 
 def normalize_text(value):
     if value is None:
         return ""
 
     value = str(value).lower()
-    value = re.sub(r"https?://\S+|www\.\S+", " ", value)
-    value = re.sub(r"[^a-z0-9\s]", " ", value)
-    value = re.sub(r"\s+", " ", value).strip()
+
+    value = re.sub(
+        r"https?://\S+|www\.\S+",
+        " ",
+        value
+    )
+
+    value = re.sub(
+        r"[^a-z0-9\s]",
+        " ",
+        value
+    )
+
+    value = re.sub(
+        r"\s+",
+        " ",
+        value
+    ).strip()
 
     return value
 
@@ -43,144 +75,303 @@ def tokenize(value):
     return [
         token
         for token in value.split()
-        if len(token) >= 2 and token not in STOPWORDS
+        if len(token) >= 2
+        and token not in STOPWORDS
     ]
 
 
-if not DB_FILE.exists():
-    raise FileNotFoundError(
-        f"Blocking database not found: {DB_FILE}"
+# ============================================================
+# ADDRESS BLOCK KEY
+# ============================================================
+
+def address_block_key(value):
+    """
+    Create a conservative address key:
+
+        (first number, longest meaningful word)
+
+    Example:
+        4303 Elkins Avenue Unit B Nashville TN
+
+    becomes approximately:
+
+        ('4303', 'nashville')
+    """
+
+    normalized = normalize_text(value)
+
+    if not normalized:
+        return None
+
+    tokens = normalized.split()
+
+    numbers = [
+        token
+        for token in tokens
+        if token.isdigit()
+    ]
+
+    words = [
+        token
+        for token in tokens
+        if token.isalpha()
+        and len(token) >= 5
+        and token not in STOPWORDS
+    ]
+
+    if not numbers or not words:
+        return None
+
+    number = numbers[0]
+
+    # Longest meaningful word.
+    word = max(
+        words,
+        key=len
     )
 
+    return number, word
+
+
+# ============================================================
+# SIMILARITY
+# ============================================================
+
+def sequence_similarity(a, b):
+    if not a or not b:
+        return 0.0
+
+    return SequenceMatcher(
+        None,
+        a,
+        b
+    ).ratio()
+
+
+def token_similarity(a, b):
+    ta = set(tokenize(a))
+    tb = set(tokenize(b))
+
+    if not ta or not tb:
+        return 0.0
+
+    return len(ta & tb) / len(ta | tb)
+
+
+# ============================================================
+# START
+# ============================================================
 
 print("=" * 70)
-print("FINAL CANDIDATE GENERATION")
+print("FAST HYBRID TEST PREDICTION")
 print("=" * 70)
 
-print(f"Database: {DB_FILE}")
-print(
-    f"Database size: "
-    f"{DB_FILE.stat().st_size / (1024 ** 3):.2f} GB"
+start_time = time.time()
+
+
+# ============================================================
+# LOAD SOURCE2 + SOURCE3
+# ============================================================
+
+print()
+print("Loading test reference data...")
+
+s2 = pd.read_csv(
+    TEST_DIR / "test_source2.tsv",
+    sep="\t",
+    dtype=str,
+    keep_default_na=False
 )
-print(f"Chunk size: {CHUNK_SIZE:,}")
-print(f"Output: {OUTPUT_FILE}")
-print()
+
+s3 = pd.read_csv(
+    TEST_DIR / "test_source3.tsv",
+    sep="\t",
+    dtype=str,
+    keep_default_na=False
+)
+
+reference = pd.concat(
+    [s2, s3],
+    ignore_index=True
+)
+
+print(
+    f"Reference rows: {len(reference):,}"
+)
 
 
-# ------------------------------------------------------------
-# CONNECT TO DATABASE
-# ------------------------------------------------------------
+# ============================================================
+# NORMALIZE REFERENCE
+# ============================================================
 
-conn = sqlite3.connect(str(DB_FILE))
+print("Normalizing reference data...")
 
-conn.execute("PRAGMA journal_mode=WAL")
-conn.execute("PRAGMA synchronous=NORMAL")
-conn.execute("PRAGMA temp_store=FILE")
+reference["country_norm"] = (
+    reference["country"]
+    .astype(str)
+    .str.lower()
+    .str.strip()
+)
 
-cursor = conn.cursor()
+reference["name_norm"] = (
+    reference["business_name"]
+    .map(normalize_text)
+)
 
-
-# ------------------------------------------------------------
-# CHECK DATABASE
-# ------------------------------------------------------------
-
-print("Checking database...")
-
-record_count = cursor.execute(
-    "SELECT COUNT(*) FROM records"
-).fetchone()[0]
-
-token_count = cursor.execute(
-    "SELECT COUNT(*) FROM token_index"
-).fetchone()[0]
-
-print(f"Records:    {record_count:,}")
-print(f"Token rows: {token_count:,}")
-print()
+reference["address_norm"] = (
+    reference["business_address"]
+    .map(normalize_text)
+)
 
 
-# ------------------------------------------------------------
-# SOURCE1
-# ------------------------------------------------------------
+# ============================================================
+# BUILD EXACT NAME INDEX
+# ============================================================
 
-source1_file = TRAIN_DIR / "train_source1.tsv"
+print("Building exact-name index...")
 
-total_source1 = sum(
-    1
-    for _ in open(
-        source1_file,
-        "r",
-        encoding="utf-8",
-        errors="ignore"
-    )
-) - 1
+name_index = {}
 
-total_chunks = (
-    total_source1 + CHUNK_SIZE - 1
-) // CHUNK_SIZE
+for pos, row in enumerate(
+    reference[
+        ["country_norm", "name_norm"]
+    ].itertuples(index=False)
+):
 
-print(f"Source1 rows: {total_source1:,}")
-print(f"Total chunks: {total_chunks:,}")
-print()
+    country, name = row
 
+    if not name:
+        continue
 
-# ------------------------------------------------------------
-# RESUME SUPPORT
-# ------------------------------------------------------------
-
-# If output already exists, determine how many Source1 rows
-# have already been completely processed.
-#
-# Each chunk is written as a temporary file first.
-# After successful completion, it is appended to the final file.
-#
-# We use a progress file to know exactly where to resume.
-
-PROGRESS_FILE = PROCESSED_DIR / "candidate_generation_progress.txt"
-
-if PROGRESS_FILE.exists():
-    try:
-        start_chunk = int(
-            PROGRESS_FILE.read_text().strip()
-        )
-    except Exception:
-        start_chunk = 0
-else:
-    start_chunk = 0
-
-
-# ------------------------------------------------------------
-# INITIALIZE OUTPUT
-# ------------------------------------------------------------
-
-if start_chunk == 0:
-
-    with open(
-        OUTPUT_FILE,
-        "w",
-        encoding="utf-8"
-    ) as f:
-        f.write(
-            "source1_id\tcandidate_id\tsource\n"
-        )
-
-    print("Starting candidate generation from chunk 1.")
-
-else:
-
-    print(
-        f"Resuming from chunk "
-        f"{start_chunk + 1:,} / {total_chunks:,}"
+    key = (
+        country,
+        name
     )
 
+    name_index.setdefault(
+        key,
+        []
+    ).append(pos)
+
+
+print(
+    f"Exact-name keys: {len(name_index):,}"
+)
+
+
+# ============================================================
+# BUILD EXACT ADDRESS INDEX
+# ============================================================
+
+print("Building exact-address index...")
+
+address_index = {}
+
+for pos, row in enumerate(
+    reference[
+        ["country_norm", "address_norm"]
+    ].itertuples(index=False)
+):
+
+    country, address = row
+
+    if not address:
+        continue
+
+    key = (
+        country,
+        address
+    )
+
+    address_index.setdefault(
+        key,
+        []
+    ).append(pos)
+
+
+print(
+    f"Exact-address keys: {len(address_index):,}"
+)
+
+
+# ============================================================
+# BUILD SELECTIVE ADDRESS COMPOSITE INDEX
+# ============================================================
+
+print("Building address composite index...")
+
+address_block_index = {}
+
+for pos, row in enumerate(
+    reference[
+        ["country_norm", "address_norm"]
+    ].itertuples(index=False)
+):
+
+    country, address = row
+
+    key = address_block_key(address)
+
+    if key is None:
+        continue
+
+    number, word = key
+
+    full_key = (
+        country,
+        number,
+        word
+    )
+
+    address_block_index.setdefault(
+        full_key,
+        []
+    ).append(pos)
+
+
+# Remove very large blocks.
+address_block_index = {
+    key: positions
+    for key, positions
+    in address_block_index.items()
+    if len(positions) <= MAX_COMPOSITE_CANDIDATES
+}
+
+print(
+    f"Usable composite keys: "
+    f"{len(address_block_index):,}"
+)
+
+
+# ============================================================
+# LOAD SOURCE1 IDS
+# ============================================================
+
+source1_file = (
+    TEST_DIR / "test_source1.tsv"
+)
+
+test_source1 = pd.read_csv(
+    source1_file,
+    sep="\t",
+    dtype=str,
+    keep_default_na=False,
+    usecols=["entity_id"]
+)
+
+test_source1 = test_source1.rename(
+    columns={
+        "entity_id": "source1_entity_id"
+    }
+)
+
+
+# ============================================================
+# PROCESS SOURCE1
+# ============================================================
+
 print()
-
-
-# ------------------------------------------------------------
-# PROCESS SOURCE1 IN CHUNKS
-# ------------------------------------------------------------
-
-global_start = time.time()
+print("Processing Source1...")
 
 reader = pd.read_csv(
     source1_file,
@@ -190,357 +381,288 @@ reader = pd.read_csv(
     chunksize=CHUNK_SIZE
 )
 
+results = []
 
-for chunk_number, df in enumerate(reader):
+total_rows = 0
+total_exact_name = 0
+total_exact_address = 0
+total_composite = 0
 
-    # Skip chunks already completed.
-    if chunk_number < start_chunk:
-        continue
+chunk_start_time = time.time()
 
-    chunk_start = time.time()
 
-    print(
-        "=" * 70
-    )
-    print(
-        f"CHUNK {chunk_number + 1:,} / "
-        f"{total_chunks:,}"
-    )
-
-    first_row = chunk_number * CHUNK_SIZE + 1
-    last_row = min(
-        (chunk_number + 1) * CHUNK_SIZE,
-        total_source1
-    )
-
-    print(
-        f"Source1 rows: "
-        f"{first_row:,} - {last_row:,}"
-    )
-
-    # --------------------------------------------------------
-    # NORMALIZE SOURCE1
-    # --------------------------------------------------------
-
-    df["country_norm"] = (
-        df["country"]
-        .astype(str)
-        .str.lower()
-        .str.strip()
-    )
-
-    df["name_norm"] = (
-        df["business_name"]
-        .map(normalize_text)
-    )
-
-    df["address_norm"] = (
-        df["business_address"]
-        .map(normalize_text)
-    )
-
-    # --------------------------------------------------------
-    # COLLECT UNIQUE NAME TOKEN REQUESTS
-    # --------------------------------------------------------
-
-    name_requests = set()
+for chunk_number, df in enumerate(
+    reader,
+    start=1
+):
 
     for _, row in df.iterrows():
 
-        country = row["country_norm"]
+        s1_id = row["entity_id"]
 
-        for token in tokenize(
+        country = (
+            str(row["country"])
+            .lower()
+            .strip()
+        )
+
+        name = normalize_text(
             row["business_name"]
-        ):
-            name_requests.add(
-                (country, token)
+        )
+
+        address = normalize_text(
+            row["business_address"]
+        )
+
+        matched_ids = set()
+
+
+        # ----------------------------------------------------
+        # 1. EXACT NAME
+        # ----------------------------------------------------
+
+        exact_name_positions = name_index.get(
+            (
+                country,
+                name
+            ),
+            []
+        )
+
+        if exact_name_positions:
+
+            for pos in exact_name_positions:
+
+                matched_ids.add(
+                    reference.iloc[pos]["entity_id"]
+                )
+
+            total_exact_name += len(
+                exact_name_positions
             )
 
-    print(
-        f"Unique name/token requests: "
-        f"{len(name_requests):,}"
-    )
 
-    # --------------------------------------------------------
-    # NAME TOKEN LOOKUPS
-    # --------------------------------------------------------
+        # ----------------------------------------------------
+        # 2. EXACT ADDRESS
+        # ----------------------------------------------------
 
-    token_candidates = {}
-
-    for country, token in name_requests:
-
-        rows = cursor.execute(
-            """
-            SELECT entity_id, source
-            FROM token_index
-            WHERE country = ?
-              AND token = ?
-            """,
-            (country, token)
-        ).fetchall()
-
-        token_candidates[
-            (country, token)
-        ] = rows
-
-    # --------------------------------------------------------
-    # EXACT NAME LOOKUPS
-    # --------------------------------------------------------
-
-    name_exact = {}
-
-    unique_names = set(
-        (
-            r["country_norm"],
-            r["name_norm"]
+        exact_address_positions = address_index.get(
+            (
+                country,
+                address
+            ),
+            []
         )
-        for _, r in df.iterrows()
-        if r["name_norm"]
-    )
 
-    for country, name in unique_names:
+        if exact_address_positions:
 
-        rows = cursor.execute(
-            """
-            SELECT entity_id, source
-            FROM records
-            WHERE country = ?
-              AND name = ?
-            """,
-            (country, name)
-        ).fetchall()
+            for pos in exact_address_positions:
 
-        name_exact[
-            (country, name)
-        ] = rows
+                matched_ids.add(
+                    reference.iloc[pos]["entity_id"]
+                )
 
-    # --------------------------------------------------------
-    # EXACT ADDRESS LOOKUPS
-    # --------------------------------------------------------
+            total_exact_address += len(
+                exact_address_positions
+            )
 
-    address_exact = {}
 
-    unique_addresses = set(
-        (
-            r["country_norm"],
-            r["address_norm"]
+        # ----------------------------------------------------
+        # 3. SELECTIVE ADDRESS COMPOSITE
+        # ----------------------------------------------------
+
+        block_key = address_block_key(
+            address
         )
-        for _, r in df.iterrows()
-        if r["address_norm"]
-    )
 
-    for country, address in unique_addresses:
+        if block_key is not None:
 
-        rows = cursor.execute(
-            """
-            SELECT entity_id, source
-            FROM records
-            WHERE country = ?
-              AND address = ?
-            """,
-            (country, address)
-        ).fetchall()
+            number, word = block_key
 
-        address_exact[
-            (country, address)
-        ] = rows
+            positions = address_block_index.get(
+                (
+                    country,
+                    number,
+                    word
+                ),
+                []
+            )
 
-    # --------------------------------------------------------
-    # WRITE CHUNK TO TEMP FILE
-    # --------------------------------------------------------
+            for pos in positions:
 
-    temp_file = (
-        PROCESSED_DIR
-        / f"candidate_chunk_{chunk_number:05d}.tsv"
-    )
+                candidate = reference.iloc[pos]
 
-    chunk_candidate_count = 0
+                candidate_name = (
+                    candidate["name_norm"]
+                )
 
-    with open(
-        temp_file,
-        "w",
-        encoding="utf-8"
-    ) as f:
+                candidate_address = (
+                    candidate["address_norm"]
+                )
 
-        for _, row in df.iterrows():
+                # Address similarity
+                address_ratio = sequence_similarity(
+                    address,
+                    candidate_address
+                )
 
-            s1_id = row["entity_id"]
+                address_token_ratio = token_similarity(
+                    address,
+                    candidate_address
+                )
 
-            country = row["country_norm"]
-            name = row["name_norm"]
-            address = row["address_norm"]
+                # Name similarity
+                name_ratio = sequence_similarity(
+                    name,
+                    candidate_name
+                )
 
-            candidate_set = set()
+                name_token_ratio = token_similarity(
+                    name,
+                    candidate_name
+                )
 
-            # -----------------------------------------------
-            # NAME-TOKEN BLOCKING
-            # -----------------------------------------------
-
-            for token in tokenize(
-                row["business_name"]
-            ):
-
-                for candidate_id, source in (
-                    token_candidates.get(
-                        (country, token),
-                        []
-                    )
+                # Conservative acceptance.
+                #
+                # The composite block already shares:
+                # country + address number + word.
+                #
+                # We additionally require reasonable
+                # address OR name similarity.
+                if (
+                    address_ratio >= 0.45
+                    or address_token_ratio >= 0.30
+                    or name_ratio >= 0.55
+                    or name_token_ratio >= 0.30
                 ):
 
-                    candidate_set.add(
-                        (candidate_id, source)
+                    matched_ids.add(
+                        candidate["entity_id"]
                     )
 
-            # -----------------------------------------------
-            # EXACT NAME
-            # -----------------------------------------------
+                    total_composite += 1
 
-            for candidate_id, source in (
-                name_exact.get(
-                    (country, name),
-                    []
+
+        # ----------------------------------------------------
+        # STORE RESULT
+        # ----------------------------------------------------
+
+        if matched_ids:
+
+            results.append({
+                "source1_entity_id": s1_id,
+                "matched_entity_ids": ",".join(
+                    sorted(matched_ids)
                 )
-            ):
+            })
 
-                candidate_set.add(
-                    (candidate_id, source)
-                )
+        else:
 
-            # -----------------------------------------------
-            # EXACT ADDRESS
-            # -----------------------------------------------
+            results.append({
+                "source1_entity_id": s1_id,
+                "matched_entity_ids": ""
+            })
 
-            for candidate_id, source in (
-                address_exact.get(
-                    (country, address),
-                    []
-                )
-            ):
 
-                candidate_set.add(
-                    (candidate_id, source)
-                )
+    total_rows += len(df)
 
-            # -----------------------------------------------
-            # WRITE CANDIDATES
-            # -----------------------------------------------
-
-            for candidate_id, source in candidate_set:
-
-                f.write(
-                    f"{s1_id}\t"
-                    f"{candidate_id}\t"
-                    f"{source}\n"
-                )
-
-                chunk_candidate_count += 1
-
-    # --------------------------------------------------------
-    # APPEND COMPLETED CHUNK TO FINAL OUTPUT
-    # --------------------------------------------------------
-
-    with open(
-        temp_file,
-        "r",
-        encoding="utf-8"
-    ) as source_file:
-
-        with open(
-            OUTPUT_FILE,
-            "a",
-            encoding="utf-8"
-        ) as output_file:
-
-            for line in source_file:
-                output_file.write(line)
-
-    # Remove temporary chunk
-    temp_file.unlink()
-
-    # Mark chunk completed
-    PROGRESS_FILE.write_text(
-        str(chunk_number + 1)
-    )
-
-    chunk_elapsed = (
-        time.time() - chunk_start
-    )
-
-    total_elapsed = (
-        time.time() - global_start
-    )
-
-    completed = chunk_number + 1
-
-    remaining = (
-        total_chunks - completed
-    )
-
-    if completed:
-        avg_chunk_time = (
-            total_elapsed / completed
-        )
-    else:
-        avg_chunk_time = 0
-
-    estimated_remaining = (
-        remaining * avg_chunk_time
-    )
-
-    print()
-    print(
-        f"Candidates this chunk: "
-        f"{chunk_candidate_count:,}"
+    elapsed = (
+        time.time() - chunk_start_time
     )
 
     print(
-        f"Chunk time: "
-        f"{chunk_elapsed / 60:.2f} minutes"
+        f"Chunk {chunk_number:02d} | "
+        f"Source1 processed: {total_rows:,} | "
+        f"Elapsed: {elapsed / 60:.2f} min"
     )
 
-    print(
-        f"Total elapsed: "
-        f"{total_elapsed / 60:.2f} minutes"
-    )
 
-    print(
-        f"Estimated remaining: "
-        f"{estimated_remaining / 60:.2f} minutes"
-    )
+# ============================================================
+# CREATE SUBMISSION
+# ============================================================
 
-    print(
-        f"Progress: "
-        f"{completed:,}/{total_chunks:,}"
-    )
+print()
+print("Creating submission...")
 
-    print()
+submission = pd.DataFrame(
+    results
+)
+
+# Ensure every Source1 row appears exactly once.
+submission = test_source1.merge(
+    submission,
+    on="source1_entity_id",
+    how="left"
+)
+
+submission["matched_entity_ids"] = (
+    submission["matched_entity_ids"]
+    .fillna("")
+)
 
 
-# ------------------------------------------------------------
-# FINISHED
-# ------------------------------------------------------------
+# ============================================================
+# WRITE
+# ============================================================
 
-conn.close()
+submission.to_csv(
+    OUTPUT_FILE,
+    index=False
+)
 
-elapsed = time.time() - global_start
 
+# ============================================================
+# FINAL REPORT
+# ============================================================
+
+nonempty = (
+    submission["matched_entity_ids"]
+    .astype(str)
+    .str.len()
+    .gt(0)
+    .sum()
+)
+
+empty = (
+    len(submission) - nonempty
+)
+
+print()
 print("=" * 70)
-print("CANDIDATE GENERATION COMPLETE")
+print("FAST HYBRID TEST PREDICTION COMPLETE")
 print("=" * 70)
 
 print(
-    f"Source1 rows: "
-    f"{total_source1:,}"
+    f"Test Source1 rows: {len(submission):,}"
+)
+
+print(
+    f"Rows with matches: {nonempty:,}"
+)
+
+print(
+    f"Rows without matches: {empty:,}"
+)
+
+print(
+    f"Exact-name matches: {total_exact_name:,}"
+)
+
+print(
+    f"Exact-address matches: {total_exact_address:,}"
+)
+
+print(
+    f"Composite matches: {total_composite:,}"
+)
+
+print(
+    f"Output: {OUTPUT_FILE}"
 )
 
 print(
     f"Total time: "
-    f"{elapsed / 3600:.2f} hours"
-)
-
-print(
-    f"Output: "
-    f"{OUTPUT_FILE}"
+    f"{(time.time() - start_time) / 60:.2f} minutes"
 )
 
 print("=" * 70)
